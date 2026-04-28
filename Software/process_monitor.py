@@ -25,7 +25,7 @@ Install
 
 Usage
 -----
-    python process_monitor.py                        # default 192.168.1.100
+    python process_monitor.py                        # default 10.10.39.220
     python process_monitor.py --ip 10.0.0.50         # custom IP
     python process_monitor.py --headless              # log only, no GUI
     python process_monitor.py --interval 0.5          # sample every 500 ms
