@@ -2,7 +2,6 @@
 
 Real-time data acquisition, logging, and visualization for the **Schneider Electric Modicon TM221CE16R** programmable logic controller over Modbus TCP.
 
-![Dashboard Screenshot](docs/dashboard_screenshot.png)
 
 ## Overview
 
