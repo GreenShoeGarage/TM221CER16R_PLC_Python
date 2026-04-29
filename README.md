@@ -281,4 +281,4 @@ All addresses are 0-based (pymodbus convention).
 
 ## License
 
-MIT
+GPL-3.0 license
