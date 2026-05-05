@@ -9,27 +9,8 @@ The TM221CE16R has 2 built-in analog inputs (0–10V, 10-bit resolution),
 9 digital inputs, and 7 relay outputs. This script reads all available
 I/O and presents it in a live dashboard.
 
-I/O Map (default configuration — Mixing Tank):
-  - Temperature sensor     → %IW0  (analog input, 0–10V = 0.0–100.0 °C)
-  - Pressure sensor        → %IW1  (analog input, 0–10V = 0.0–10.0 bar)
-  - Heater output          → %Q0.0 (digital output, relay)
-  - Mixer motor            → %Q0.1 (digital output, relay)
-  - Inlet valve            → %Q0.2 (digital output, relay)
-  - Outlet valve           → %Q0.3 (digital output, relay)
-  - Start button           → %I0.0 (digital input)
-  - Stop button            → %I0.1 (digital input)
-  - High-temp switch       → %I0.2 (digital input)
-  - High-pressure switch   → %I0.3 (digital input)
-  - Tank level high        → %I0.4 (digital input)
-  - Tank level low         → %I0.5 (digital input)
-  - Temperature setpoint   → %MW0  (holding register, written by HMI/SCADA)
-  - Pressure setpoint      → %MW1
-  - Alarm word             → %MW10 (bit-packed alarm flags from PLC logic)
-  - PLC cycle counter      → %MW20
-
-Note: If you add a TM3AI4 or TMC2AI2 expansion module for additional
-analog inputs, simply append entries to ANALOG_TAGS with the correct
-register addresses and the dashboard will adapt automatically.
+Supports a --simulate flag to run the full dashboard and logging pipeline
+with realistic simulated process data, no PLC hardware required.
 
 Install
 -------
@@ -37,16 +18,16 @@ Install
 
 Usage
 -----
-    python process_monitor.py                        # default 10.10.39.220
-    python process_monitor.py --ip 10.10.39.220      # explicit IP
-    python process_monitor.py --headless              # log only, no GUI
-    python process_monitor.py --interval 0.5          # sample every 500 ms
-    python process_monitor.py --duration 3600         # run for 1 hour then stop
+    python process_monitor.py --simulate              # simulated data, no PLC needed
+    python process_monitor.py --ip 10.10.39.220       # real PLC
+    python process_monitor.py --headless --simulate    # simulated, console only
 """
 
 import argparse
 import csv
+import math
 import os
+import random
 import signal
 import sys
 import threading
@@ -55,17 +36,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional
 
-try:
-    from pymodbus.client import ModbusTcpClient
-except ImportError:
-    sys.exit("pymodbus not found.  Install with:  pip install pymodbus")
-
 # ── Process tag definitions ──────────────────────────────────────────────────
-# Each tag describes one piece of data to read from the PLC.
-#
-# The TM221CE16R has 2 built-in 0–10V analog inputs at 10-bit resolution
-# (raw range 0–1023). Adjust eng_min/eng_max to match your sensor's
-# calibrated output range.
 
 ANALOG_TAGS = [
     # (name,       register_type, address, scale_min, scale_max, unit,   eng_min, eng_max)
@@ -74,7 +45,6 @@ ANALOG_TAGS = [
 ]
 
 DIGITAL_OUTPUT_TAGS = [
-    # (name,         address)    — read via FC1 (coils)
     ("Heater",       0),
     ("Mixer_Motor",  1),
     ("Inlet_Valve",  2),
@@ -82,7 +52,6 @@ DIGITAL_OUTPUT_TAGS = [
 ]
 
 DIGITAL_INPUT_TAGS = [
-    # (name,             address)    — read via FC2 (discrete inputs)
     ("Start_Button",     0),
     ("Stop_Button",      1),
     ("HiTemp_Switch",    2),
@@ -92,7 +61,6 @@ DIGITAL_INPUT_TAGS = [
 ]
 
 SETPOINT_TAGS = [
-    # (name,              address, unit)
     ("Temp_Setpoint",     0, "°C"),
     ("Pressure_Setpoint", 1, "bar"),
 ]
@@ -183,12 +151,145 @@ class CSVLogger:
                 self._file.close()
 
 
-# ── PLC reader ───────────────────────────────────────────────────────────────
+# ── Simulated PLC reader ────────────────────────────────────────────────────
+
+class SimulatedPLCReader:
+    """Generates realistic simulated process data without a real PLC.
+
+    Simulates a mixing-tank process:
+      - Temperature ramps toward setpoint with PID-like behavior
+      - Pressure follows a slow sine wave with noise
+      - Digital outputs cycle based on process state
+      - Alarms trigger when values exceed thresholds
+    """
+
+    def __init__(self):
+        self.connected = False
+        self._tick = 0
+        self._cycle_count = 0
+
+        # Process state
+        self._temp = 25.0       # starting temperature (cold tank)
+        self._pressure = 3.5    # starting pressure
+        self._temp_sp = 65      # temperature setpoint
+        self._press_sp = 5      # pressure setpoint
+        self._running = False   # process running state
+        self._start_tick = 0
+
+    def connect(self):
+        self.connected = True
+        return True
+
+    def disconnect(self):
+        self.connected = False
+
+    def read_all(self) -> Optional[dict]:
+        self._tick += 1
+        self._cycle_count += 1
+        t = self._tick
+        record = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]}
+
+        # ── Process simulation ───────────────────────────────────────────
+        # Start the process after 5 seconds
+        if t == 5:
+            self._running = True
+            self._start_tick = t
+
+        elapsed = t - self._start_tick if self._running else 0
+
+        # Temperature: ramp toward setpoint with overshoot, then settle
+        if self._running:
+            # Simulate a first-order response with slight overshoot
+            tau = 60.0  # time constant in ticks
+            target = self._temp_sp
+            error = target - self._temp
+            self._temp += error * (1.0 / tau) + random.gauss(0, 0.3)
+
+            # Add occasional disturbances
+            if t % 120 == 0:
+                self._temp += random.gauss(0, 2.0)
+        else:
+            self._temp = 25.0 + random.gauss(0, 0.2)
+
+        # Pressure: slow oscillation around setpoint
+        self._pressure = (self._press_sp
+                          + 0.8 * math.sin(t * 0.04)
+                          + 0.3 * math.sin(t * 0.11 + 1.5)
+                          + random.gauss(0, 0.15))
+
+        # Clamp to realistic ranges
+        self._temp = max(0, min(100, self._temp))
+        self._pressure = max(0, min(10, self._pressure))
+
+        record["Temperature"] = round(self._temp, 2)
+        record["Pressure"] = round(self._pressure, 2)
+
+        # ── Digital outputs (process-dependent) ──────────────────────────
+        if self._running:
+            # Heater: ON when below setpoint - 2°C, OFF when above setpoint
+            heater_on = self._temp < (self._temp_sp - 1.0)
+            # Mixer: always ON when running
+            mixer_on = True
+            # Inlet valve: ON during first 60 ticks of run (filling)
+            inlet_on = elapsed < 60
+            # Outlet valve: ON after 180 ticks (draining cycle)
+            outlet_on = elapsed > 180 and (elapsed % 120) > 60
+        else:
+            heater_on = False
+            mixer_on = False
+            inlet_on = False
+            outlet_on = False
+
+        record["out_Heater"] = heater_on
+        record["out_Mixer_Motor"] = mixer_on
+        record["out_Inlet_Valve"] = inlet_on
+        record["out_Outlet_Valve"] = outlet_on
+
+        # ── Digital inputs (simulated field signals) ─────────────────────
+        record["in_Start_Button"] = (t == 5)  # momentary press at tick 5
+        record["in_Stop_Button"] = False
+        record["in_HiTemp_Switch"] = self._temp > 80.0
+        record["in_HiPress_Switch"] = self._pressure > 8.0
+        record["in_Level_High"] = elapsed > 50 and self._running
+        record["in_Level_Low"] = elapsed < 20 or not self._running
+
+        # ── Setpoints ────────────────────────────────────────────────────
+        record["Temp_Setpoint"] = self._temp_sp
+        record["Pressure_Setpoint"] = self._press_sp
+
+        # ── Alarms (threshold-based) ─────────────────────────────────────
+        alarm_word = 0
+        if self._temp > 80.0:
+            alarm_word |= (1 << 0)   # Over_Temp
+        if self._pressure > 8.0:
+            alarm_word |= (1 << 1)   # Over_Pressure
+        if record["in_Level_Low"]:
+            alarm_word |= (1 << 2)   # Low_Level
+        if False:                    # High_Level placeholder
+            alarm_word |= (1 << 3)
+
+        record["alarm_word"] = alarm_word
+        record["alarms_hex"] = f"0x{alarm_word:04X}"
+        record["active_alarms"] = [
+            ALARM_BITS[b] for b in range(min(len(ALARM_BITS), 16))
+            if alarm_word & (1 << b)
+        ]
+
+        record["cycle_count"] = self._cycle_count
+
+        return record
+
+
+# ── Real PLC reader ──────────────────────────────────────────────────────────
 
 class PLCReader:
     """Reads all configured tags from the PLC in one scan cycle."""
 
     def __init__(self, ip, port=502, slave=1, timeout=3):
+        try:
+            from pymodbus.client import ModbusTcpClient
+        except ImportError:
+            sys.exit("pymodbus not found.  Install with:  pip install pymodbus")
         self.client = ModbusTcpClient(ip, port=port, timeout=timeout)
         self.slave = slave
         self.connected = False
@@ -235,7 +336,7 @@ class PLCReader:
                 for i, (name, _addr) in enumerate(DIGITAL_INPUT_TAGS):
                     record[f"in_{name}"] = bool(result.bits[i])
         except Exception:
-            pass  # non-critical — digital inputs are nice-to-have
+            pass
 
         # ── Setpoints (%MW0, %MW1) ───────────────────────────────────────
         try:
@@ -244,7 +345,7 @@ class PLCReader:
                 for i, (name, _addr, _unit) in enumerate(SETPOINT_TAGS):
                     record[name] = result.registers[i]
         except Exception:
-            pass  # non-critical
+            pass
 
         # ── Alarm word (%MW10) & cycle counter (%MW20) ───────────────────
         try:
@@ -287,11 +388,10 @@ def run_dashboard(history, stop_event, interval):
         stop_event.wait()
         return
 
-    # Layout: 2 rows × 2 columns
-    #   [Temperature trend ] [Pressure trend ]
-    #   [Digital I/O status] [Alarms         ]
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
     fig.suptitle("TM221CE16R Process Monitor — Mixing Tank", fontsize=14, fontweight="bold")
+    fig.text(0.99, 0.97, "GREEN SHOE GARAGE", fontsize=9, color="#6c7086",
+             fontfamily="monospace", fontweight="bold", ha="right", va="top", alpha=0.7)
     fig.patch.set_facecolor("#1e1e2e")
 
     COLORS = {
@@ -314,7 +414,6 @@ def run_dashboard(history, stop_event, interval):
                 spine.set_color(style["grid"])
             ax.grid(True, color=style["grid"], alpha=0.3, linewidth=0.5)
 
-    # Axes assignments
     ax_temp   = axes[0][0]
     ax_press  = axes[0][1]
     ax_dio    = axes[1][0]
@@ -331,7 +430,6 @@ def run_dashboard(history, stop_event, interval):
 
         times = [datetime.strptime(d["timestamp"], "%Y-%m-%d %H:%M:%S.%f") for d in data]
 
-        # ── Analog trends (2 channels) ───────────────────────────────────
         for ax, tag_name, unit, ylim, sp_tag in [
             (ax_temp,  "Temperature", "°C",  (0, 110),  "Temp_Setpoint"),
             (ax_press, "Pressure",    "bar", (0, 12),   "Pressure_Setpoint"),
@@ -348,7 +446,6 @@ def run_dashboard(history, stop_event, interval):
                          color=style["fg"], fontsize=11, pad=6)
             ax.tick_params(colors=style["fg"], labelsize=7)
 
-            # Setpoint overlay
             if data and sp_tag:
                 sp = data[-1].get(sp_tag, None)
                 if sp is not None and sp > 0:
@@ -361,12 +458,11 @@ def run_dashboard(history, stop_event, interval):
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
             plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
 
-        # ── Digital I/O status (outputs + inputs) ────────────────────────
+        # ── Digital I/O panel ────────────────────────────────────────────
         ax_dio.clear()
         ax_dio.set_facecolor(style["bg"])
         ax_dio.set_title("Digital I/O", color=style["fg"], fontsize=11, pad=6)
 
-        # Combine outputs and inputs into one panel
         all_dio = []
         for name, _addr in DIGITAL_OUTPUT_TAGS:
             all_dio.append((f"Q  {name.replace('_', ' ')}", f"out_{name}"))
@@ -417,7 +513,7 @@ def run_dashboard(history, stop_event, interval):
     plt.show()
 
 
-# ── Console display (headless fallback) ──────────────────────────────────────
+# ── Console display ──────────────────────────────────────────────────────────
 
 def print_console_record(record, sample_num):
     ts = record["timestamp"]
@@ -457,14 +553,12 @@ def main():
     parser.add_argument("--interval", type=float, default=1.0, help="Polling interval (seconds)")
     parser.add_argument("--duration", type=int, default=0,     help="Run for N seconds (0=forever)")
     parser.add_argument("--headless", action="store_true",     help="Console only, no GUI")
+    parser.add_argument("--simulate", action="store_true",     help="Use simulated data (no PLC needed)")
     parser.add_argument("--logdir",   default="logs",          help="CSV log directory")
     parser.add_argument("--history",  type=int, default=300,   help="Max data points in chart")
     args = parser.parse_args()
 
-    # Ring buffer for chart data
     history = deque(maxlen=args.history)
-
-    # Stop event for clean shutdown
     stop_event = threading.Event()
 
     def on_signal(_sig, _frame):
@@ -474,22 +568,31 @@ def main():
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    # Connect to PLC
-    reader = PLCReader(args.ip, port=args.port, slave=args.slave)
-    print(f"Connecting to PLC at {args.ip}:{args.port} (slave {args.slave})...")
+    # ── Select reader ────────────────────────────────────────────────────
+    print("┌─────────────────────────────────────────────┐")
+    print("│  GREEN SHOE GARAGE — TM221 Process Monitor  │")
+    print("└─────────────────────────────────────────────┘")
+    print()
+    if args.simulate:
+        reader = SimulatedPLCReader()
+        reader.connect()
+        print("Running in SIMULATION mode — no PLC connection required.")
+        print(f"Polling every {args.interval}s.  Logging to ./{args.logdir}/")
+        print("Simulating: mixing-tank fill → heat → hold cycle")
+    else:
+        reader = PLCReader(args.ip, port=args.port, slave=args.slave)
+        print(f"Connecting to PLC at {args.ip}:{args.port} (slave {args.slave})...")
+        if not reader.connect():
+            sys.exit(f"ERROR: Cannot connect to {args.ip}:{args.port}")
+        print(f"Connected.  Polling every {args.interval}s.  Logging to ./{args.logdir}/")
+        print(f"Hardware: TM221CE16R — 2 analog inputs (10-bit), 9 DI, 7 DO (relay)")
 
-    if not reader.connect():
-        sys.exit(f"ERROR: Cannot connect to {args.ip}:{args.port}")
-
-    print(f"Connected.  Polling every {args.interval}s.  Logging to ./{args.logdir}/")
-    print(f"Hardware: TM221CE16R — 2 analog inputs (10-bit), 9 DI, 7 DO (relay)")
     if args.duration:
         print(f"Will run for {args.duration} seconds.")
     print("Press Ctrl+C to stop.\n")
 
     logger = CSVLogger(directory=args.logdir)
 
-    # Data collection thread
     sample_count = 0
     start_time = time.time()
     comm_errors = 0
@@ -497,7 +600,6 @@ def main():
     def collect_loop():
         nonlocal sample_count, comm_errors
         while not stop_event.is_set():
-            # Duration check
             if args.duration and (time.time() - start_time) >= args.duration:
                 stop_event.set()
                 break
@@ -512,7 +614,6 @@ def main():
                     print("[ERR] Too many consecutive errors. Check PLC connection.")
                     stop_event.set()
                     break
-                # Try to reconnect
                 reader.disconnect()
                 time.sleep(1)
                 reader.connect()
@@ -520,14 +621,9 @@ def main():
 
             comm_errors = 0
             sample_count += 1
-
-            # Log to CSV
             logger.log(record)
-
-            # Store for chart
             history.append(record)
 
-            # Console output
             if args.headless:
                 print_console_record(record, sample_count)
 
@@ -536,7 +632,6 @@ def main():
     collector = threading.Thread(target=collect_loop, daemon=True)
     collector.start()
 
-    # Run dashboard or wait in headless mode
     if args.headless:
         collector.join()
     else:
@@ -544,7 +639,6 @@ def main():
         stop_event.set()
         collector.join(timeout=5)
 
-    # Cleanup
     reader.disconnect()
     logger.close()
 
